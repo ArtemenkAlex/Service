@@ -1160,13 +1160,10 @@ window.AT_rtDelete = function(collection, id){
   if(!window._rtDeleted) window._rtDeleted = {};
   if(!window._rtDeleted[collection]) window._rtDeleted[collection] = {};
   window._rtDeleted[collection][String(id)] = Date.now();
-  // Сохраняем blacklist в IDB чтобы он пережил перезагрузку
+  // IDB — удаляем запись сразу
   idbOpen().then(function(db){
     var tx = db.transaction('kv','readwrite');
-    var store = tx.objectStore('kv');
-    store.delete('rt:'+path);
-    // Записываем флаг удаления — ключ с префиксом 'rt_del:'
-    store.put({k:'rt_del:'+path, v:String(Date.now())});
+    tx.objectStore('kv').delete('rt:'+path);
   }).catch(function(){});
   // Firebase или очередь
   if(_fbDb && _fbOnline){
@@ -1389,29 +1386,6 @@ function initFirebase(){
       // Подписываемся НАПРЯМУЮ на каждую коллекцию — без вложенных child_added
       // _pageLoadTs: записи старше него уже загружены из IDB/LS — не обновляем UI
       var _pageLoadTs = Date.now();
-      // Загружаем blacklist удалённых записей из IDB (переживает перезагрузку)
-      window._rtDeleted = {};
-      var _delBlacklistPrefix = 'rt_del:'+SHARED_PATH+'/';
-      idbOpen().then(function(db){
-        var tx = db.transaction('kv','readonly');
-        var req = tx.objectStore('kv').openCursor();
-        req.onsuccess = function(e){
-          var cursor = e.target.result;
-          if(!cursor) return;
-          if(cursor.key.indexOf(_delBlacklistPrefix)===0){
-            // rt_del:SHARED_PATH/col/id → извлекаем col и id
-            var rest = cursor.key.slice(_delBlacklistPrefix.length);
-            var slash = rest.indexOf('/');
-            if(slash>0){
-              var blCol = rest.slice(0,slash);
-              var blId  = rest.slice(slash+1);
-              if(!window._rtDeleted[blCol]) window._rtDeleted[blCol]={};
-              window._rtDeleted[blCol][blId] = parseInt(cursor.value.v||'0',10)||1;
-            }
-          }
-          cursor.continue();
-        };
-      }).catch(function(){});
       var RT_COLS = ['qr','trbx','filling','declaration','zayac','prev','boxes','tracking','profiles','timing_presets','announce','zrating','thanks'];
 
       function _rtHandleSnap(col, itemSnap, eventType){
@@ -1421,8 +1395,6 @@ function initFirebase(){
         var path = SHARED_PATH+'/'+col+'/'+id;
         // Проверяем blacklist удалённых — не восстанавливаем удалённые записи
         if(window._rtDeleted && window._rtDeleted[col] && window._rtDeleted[col][String(id)]){
-          // Удаляем из Firebase повторно на случай если не дошло
-          if(_fbDb && _fbOnline){ try{ _fbDb.ref(path).remove(); }catch(e){} }
           return;
         }
         if(!_fbOnline){ _fbOnline=true; if(typeof _atSyncSetState==='function') _atSyncSetState('ok'); }
