@@ -958,6 +958,94 @@ var FB_CFG = {
   projectId:"artemenktools"
 };
 
+// ── CLOUDFLARE WORKER PROXY ────────────────────────────────────────
+// Если Firebase заблокирован на WiFi — используем прокси через Cloudflare Worker.
+// Установи свой Worker URL ниже (см. инструкцию в README).
+// Формат: "https://ИМЯ-ВОРКЕРА.ТВОЙ-АККАУНТ.workers.dev"
+// Если пусто — используется прямое подключение к Firebase.
+var AT_PROXY_URL = localStorage.getItem('at_proxy_url') || '';
+window.AT_PROXY_URL = AT_PROXY_URL;
+
+// Polling интервал (мс) когда работаем через прокси (нет WebSocket)
+var AT_PROXY_POLL_MS = 3000;
+
+// REST запрос через прокси или напрямую
+function _fbRest(method, path, data, cb) {
+  var url;
+  if (AT_PROXY_URL) {
+    // Через Worker: https://worker.dev/firebase/shared/qr.json
+    url = AT_PROXY_URL.replace(/\/$/, '') + '/firebase/' + path.replace(/^\//, '') + '.json';
+  } else {
+    // Напрямую к Firebase
+    url = FB_CFG.databaseURL + '/' + path.replace(/^\//, '') + '.json';
+  }
+  var xhr = new XMLHttpRequest();
+  xhr.open(method, url);
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.timeout = 8000;
+  xhr.onload = function() {
+    try { cb(null, JSON.parse(xhr.responseText)); } catch(e) { cb(null, null); }
+  };
+  xhr.onerror = xhr.ontimeout = function() { cb(new Error('network')); };
+  xhr.send(data ? JSON.stringify(data) : null);
+}
+
+// Polling — опрашивает коллекцию каждые AT_PROXY_POLL_MS мс
+// Используется вместо WebSocket когда AT_PROXY_URL задан
+var _proxyPollers = {}; // col → {timer, lastTs}
+
+function _startProxyPolling() {
+  if (!AT_PROXY_URL) return;
+  var SHARED = window.SHARED_PATH || 'shared';
+  var POLL_COLS = ['qr','trbx','filling','declaration','zayac','prev','boxes','tracking',
+                   'profiles','timing_presets','announce','zrating','thanks'];
+  POLL_COLS.forEach(function(col) {
+    if (_proxyPollers[col]) return; // уже запущен
+    _proxyPollers[col] = { lastTs: Date.now() };
+    (function poll() {
+      _fbRest('GET', SHARED + '/' + col, null, function(err, data) {
+        if (!err && data && typeof data === 'object') {
+          Object.keys(data).forEach(function(id) {
+            var val = data[id];
+            if (!val) return;
+            var ts = (val && val.ts) || 0;
+            // Только новые записи
+            if (ts > (_proxyPollers[col].lastTs || 0)) {
+              if (window._rtDeleted && window._rtDeleted[col] && window._rtDeleted[col][String(id)]) return;
+              try {
+                var parsed = (typeof val.d === 'string') ? JSON.parse(val.d) : (val.d !== undefined ? val.d : val);
+                if (typeof _rtFire === 'function') _rtFire(col, 'add', id, parsed, ts);
+              } catch(e) {}
+              if (ts > _proxyPollers[col].lastTs) _proxyPollers[col].lastTs = ts;
+            }
+          });
+        }
+      });
+      _proxyPollers[col].timer = setTimeout(poll, AT_PROXY_POLL_MS);
+    })();
+  });
+  console.log('[AT_PROXY] 🔄 Polling запущен через', AT_PROXY_URL);
+}
+
+// Запись через прокси
+function _proxySet(path, value, cb) {
+  _fbRest('PUT', path, value, function(err) {
+    if (cb) cb(err);
+  });
+}
+
+// Удаление через прокси
+function _proxyDelete(path, cb) {
+  _fbRest('DELETE', path, null, function(err) {
+    if (cb) cb(err);
+  });
+}
+
+window._startProxyPolling = _startProxyPolling;
+window._proxySet = _proxySet;
+window._proxyDelete = _proxyDelete;
+// ──────────────────────────────────────────────────────────────────
+
 var _fbDb = null; window._fbDb = null; // Экспорт для функций вне IIFE
 var _fbOnline = false; window._fbOnline = false;
 var _fbReady = false;
@@ -1143,8 +1231,12 @@ window.AT_rtPush = function(collection, id, data){
     var tx = db.transaction('kv','readwrite');
     tx.objectStore('kv').put({k:'rt:'+path, v:JSON.stringify(value)});
   }).catch(function(){});
-  // 2. Firebase или очередь
-  if(_fbDb && _fbOnline){
+  // 2. Прокси или Firebase SDK или очередь
+  if(window.AT_PROXY_URL){
+    _proxySet(path, value, function(err){
+      if(err){ _pendingSync.push({path:path, value:value}); _pendingSave(); }
+    });
+  } else if(_fbDb && _fbOnline){
     try { _fbDb.ref(path).set(value); } catch(e){
       _pendingSync.push({path:path, value:value}); _pendingSave();
     }
@@ -1165,8 +1257,12 @@ window.AT_rtDelete = function(collection, id){
     var tx = db.transaction('kv','readwrite');
     tx.objectStore('kv').delete('rt:'+path);
   }).catch(function(){});
-  // Firebase или очередь
-  if(_fbDb && _fbOnline){
+  // Прокси или Firebase SDK или очередь
+  if(window.AT_PROXY_URL){
+    _proxyDelete(path, function(err){
+      if(err){ _pendingSync.push({path:path, del:true}); _pendingSave(); }
+    });
+  } else if(_fbDb && _fbOnline){
     try { _fbDb.ref(path).remove(); } catch(e){
       _pendingSync.push({path:path, del:true}); _pendingSave();
     }
@@ -1595,8 +1691,23 @@ idbOpen().then(function(db){
   }
 }).catch(function(e){ console.warn('[AT_DB] Init error:', e); });
 
-// Firebase loads after a short delay (non-blocking)
-setTimeout(initFirebase, 2000); // Запуск ПОСЛЕ заставки (3000ms + 800ms fadeout = 3800ms)
+// Запуск: если задан прокси — используем polling, иначе Firebase SDK
+if(window.AT_PROXY_URL){
+  // Прокси задан — запускаем polling вместо Firebase WebSocket
+  setTimeout(function(){
+    window._fbOnline = true; _fbOnline = true;
+    window._fbReady = true; _fbReady = true;
+    if(typeof _atSyncSetState==='function') _atSyncSetState('ok');
+    if(typeof _startProxyPolling==='function') _startProxyPolling();
+    // Flush pending sync через прокси
+    if(typeof _flushPending==='function') _flushPending();
+    window.dispatchEvent(new CustomEvent('AT_fb_ready'));
+    console.log('[AT_PROXY] ✅ Режим прокси активен');
+  }, 500);
+} else {
+  // Прокси не задан — обычный Firebase SDK
+  setTimeout(initFirebase, 2000); // Запуск ПОСЛЕ заставки
+}
 
 // ── Export / Import ───────────────────────────────────────────────
 window.AT_exportData = async function(){
@@ -1711,6 +1822,7 @@ window.AT_importData = async function(file){
 </div>
 <div class="setItem">
 <button onclick="openDevConsole()" style="width:100%;padding:12px;background:#333;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;margin-bottom:10px">🔧 Консоль разработчика</button>
+<button onclick="atProxySetup();closeSet()" id="proxySetBtn" style="width:100%;padding:12px;background:linear-gradient(135deg,#06b6d4,#0284c7);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600;margin-bottom:10px">🔗 Настройка прокси WiFi</button>
 <button onclick="nav('pro');closeSet()" style="width:100%;padding:12px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:600">⭐ ArtemenkPRO</button>
 </div>
 
@@ -3329,7 +3441,76 @@ m.classList.remove('a');
 setTimeout(function(){if(!m.classList.contains('a'))m.style.display='none';},320);
 }
 
-// Dev Console
+// ── PROXY SETUP ───────────────────────────────────────────────────
+function atProxySetup(){
+  var cur = localStorage.getItem('at_proxy_url') || '';
+  var modal = document.createElement('div');
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:99999;display:flex;align-items:center;justify-content:center;padding:16px';
+  var isDark = document.body.classList.contains('dark');
+  var bg = isDark?'#1a1a1a':'#fff';
+  var clr = isDark?'#fff':'#000';
+  var brd = isDark?'#444':'#ddd';
+  modal.innerHTML = '<div style="background:'+bg+';color:'+clr+';border-radius:16px;padding:28px;width:100%;max-width:420px;box-shadow:0 8px 32px rgba(0,0,0,.3)">'
+    +'<h2 style="font-size:18px;font-weight:800;margin-bottom:8px">🔗 Настройка прокси</h2>'
+    +'<p style="font-size:13px;color:#888;margin-bottom:16px;line-height:1.5">Если Firebase заблокирован на корпоративном WiFi — укажи URL своего Cloudflare Worker. Оставь пустым для прямого подключения.</p>'
+    +'<div style="margin-bottom:12px">'
+    +'<label style="font-size:12px;font-weight:700;color:#888;display:block;margin-bottom:6px">URL Cloudflare Worker</label>'
+    +'<input id="proxyUrlInput" type="url" placeholder="https://my-worker.my-account.workers.dev" value="'+pfEsc(cur)+'" '
+    +'style="width:100%;padding:11px 14px;border:2px solid '+brd+';border-radius:8px;font-size:13px;background:'+bg+';color:'+clr+';outline:none;font-family:monospace">'
+    +'</div>'
+    +'<div id="proxyStatus" style="font-size:12px;min-height:18px;margin-bottom:14px"></div>'
+    +'<div style="display:flex;gap:10px;flex-wrap:wrap">'
+    +'<button onclick="atProxyTest()" style="flex:1;padding:10px;border-radius:8px;background:linear-gradient(135deg,#06b6d4,#0284c7);color:#fff;border:none;font-size:13px;font-weight:700;cursor:pointer">🧪 Проверить</button>'
+    +'<button onclick="atProxySave()" style="flex:1;padding:10px;border-radius:8px;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;border:none;font-size:13px;font-weight:700;cursor:pointer">💾 Сохранить</button>'
+    +'<button onclick="atProxyClear()" style="padding:10px 14px;border-radius:8px;background:#fee2e2;color:#dc2626;border:none;font-size:13px;font-weight:700;cursor:pointer">✕ Сбросить</button>'
+    +'</div>'
+    +'<button onclick="this.closest(\'[data-proxy-modal]\').remove()" style="width:100%;margin-top:12px;padding:9px;border-radius:8px;background:transparent;border:1px solid '+brd+';color:#888;font-size:13px;cursor:pointer">Закрыть</button>'
+    +'</div>';
+  modal.setAttribute('data-proxy-modal','1');
+  modal.onclick = function(e){ if(e.target===modal) modal.remove(); };
+  document.body.appendChild(modal);
+  setTimeout(function(){ var i=document.getElementById('proxyUrlInput'); if(i) i.focus(); }, 100);
+}
+
+function atProxyTest(){
+  var url = (document.getElementById('proxyUrlInput')||{}).value||'';
+  var st = document.getElementById('proxyStatus');
+  if(!url){ if(st) st.innerHTML='<span style="color:#f59e0b">⚠ Введи URL Worker\'а</span>'; return; }
+  if(st) st.innerHTML='<span style="color:#888">⏳ Проверяю соединение...</span>';
+  var testUrl = url.replace(/\/$/,'') + '/firebase/shared/announce.json?shallow=true';
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', testUrl); xhr.timeout = 8000;
+  xhr.onload = function(){
+    if(xhr.status === 200 || xhr.status === 204){
+      if(st) st.innerHTML='<span style="color:#22c55e">✅ Прокси работает! Можно сохранить.</span>';
+    } else {
+      if(st) st.innerHTML='<span style="color:#f87171">❌ Ответ: HTTP '+xhr.status+'. Проверь настройки Worker\'а.</span>';
+    }
+  };
+  xhr.onerror = xhr.ontimeout = function(){
+    if(st) st.innerHTML='<span style="color:#f87171">❌ Нет ответа. Проверь URL и деплой Worker\'а.</span>';
+  };
+  xhr.send();
+}
+
+function atProxySave(){
+  var url = ((document.getElementById('proxyUrlInput')||{}).value||'').trim();
+  if(url && !url.startsWith('http')){ alert('URL должен начинаться с https://'); return; }
+  localStorage.setItem('at_proxy_url', url);
+  window.AT_PROXY_URL = url;
+  var st = document.getElementById('proxyStatus');
+  if(st) st.innerHTML='<span style="color:#22c55e">✅ Сохранено! Перезагрузи страницу.</span>';
+  setTimeout(function(){ var m=document.querySelector('[data-proxy-modal]'); if(m)m.remove(); location.reload(); }, 1200);
+}
+
+function atProxyClear(){
+  localStorage.removeItem('at_proxy_url');
+  window.AT_PROXY_URL = '';
+  var i=document.getElementById('proxyUrlInput'); if(i) i.value='';
+  var st=document.getElementById('proxyStatus'); if(st) st.innerHTML='<span style="color:#888">Прокси сброшен. Перезагрузи страницу.</span>';
+  setTimeout(function(){ location.reload(); }, 1000);
+}
+// ─────────────────────────────────────────────────────────────────
 // Master password (same as PF_SP, evaluated lazily after PF_SP is defined)
 function getMasterPassword() { return typeof PF_SP !== 'undefined' ? atob(PF_SP) : '6644913040702'; }
 function getRestrictedPassword() { return '664491'; }
