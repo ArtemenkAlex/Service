@@ -1357,7 +1357,7 @@ function initFirebase(){
               window._fbOfflineTimer = null;
               _fbOnline = false; window._fbOnline = false;
               if(typeof _atSyncSetState==='function') _atSyncSetState('offline');
-            }, 4000);
+            }, 2000);
           }
         }
       }, function(err){
@@ -1370,7 +1370,7 @@ function initFirebase(){
         var restUrl = FB_CFG.databaseURL + '/.json?shallow=true&limitToFirst=1';
         var xhr2 = new XMLHttpRequest();
         xhr2.open('GET', restUrl);
-        xhr2.timeout = 6000;
+        xhr2.timeout = 3000;
         xhr2.onload = function() {
           if (!_fbOnline && (xhr2.status === 200 || xhr2.status === 401)) {
             _fbOnline = true; window._fbOnline = true;
@@ -1596,7 +1596,7 @@ idbOpen().then(function(db){
 }).catch(function(e){ console.warn('[AT_DB] Init error:', e); });
 
 // Firebase loads after a short delay (non-blocking)
-setTimeout(initFirebase, 4000); // Запуск ПОСЛЕ заставки (3000ms + 800ms fadeout = 3800ms)
+setTimeout(initFirebase, 2000); // Запуск ПОСЛЕ заставки (3000ms + 800ms fadeout = 3800ms)
 
 // ── Export / Import ───────────────────────────────────────────────
 window.AT_exportData = async function(){
