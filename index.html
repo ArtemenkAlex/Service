@@ -1437,7 +1437,7 @@ function initFirebase(){
           return;
         }
         // Для profiles, tracking, announce — всегда вызываем listener
-        var ALWAYS_SYNC = {profiles:1, tracking:1, timing_presets:1, announce:1, boxes:1, filling:1, zayac:1, prev:1, zrating:1, thanks:1, qr:1, trbx:1};
+        var ALWAYS_SYNC = {profiles:1, tracking:1, timing_presets:1, announce:1, boxes:1, filling:1, zayac:1, prev:1, zrating:1, thanks:1};
         var isNew = val.ts && val.ts > _pageLoadTs;
         if(isNew || ALWAYS_SYNC[col]){
           try {
@@ -1447,12 +1447,19 @@ function initFirebase(){
         }
       }
 
+      // Коллекции которые могут накопить тысячи записей — ограничиваем child_added
+      // чтобы при первой подписке не получить всю историю разом (зависание браузера)
+      var _BIG_COLS = {qr:1, trbx:1, filling:1, declaration:1, zayac:1, prev:1, boxes:1, tracking:1};
+      var _BIG_LIMIT = 300; // последние 300 записей достаточно для работы
+
       RT_COLS.forEach(function(col){
-        var ref = _fbDb.ref(SHARED_PATH+'/'+col);
+        var baseRef = _fbDb.ref(SHARED_PATH+'/'+col);
+        // Для больших коллекций — ограничиваем начальный набор child_added
+        var ref = _BIG_COLS[col] ? baseRef.limitToLast(_BIG_LIMIT) : baseRef;
         // child_added — новые узлы (и все существующие при первой подписке)
         ref.on('child_added',   function(snap){ _rtHandleSnap(col, snap, 'add'); });
         // child_changed — обновление существующего узла (тот же id, новые данные)
-        ref.on('child_changed', function(snap){ _rtHandleSnap(col, snap, 'change'); });
+        baseRef.on('child_changed', function(snap){ _rtHandleSnap(col, snap, 'change'); });
         // child_removed — удаление
         ref.on('child_removed', function(snap){
           var id = snap.key;
@@ -1501,6 +1508,45 @@ function initFirebase(){
       // при первой подписке (асинхронно по одному, не блокируя UI)
       // announce загружается через отдельный init fetch ниже
       _fbReady = true;
+
+      // Загружаем последние 200 записей qr и trbx от ВСЕХ пользователей (один раз)
+      // child_added обрабатывает только isNew — поэтому старые записи других
+      // пользователей нужно подтянуть отдельным once('value')
+      var _histCols = ['qr','trbx'];
+      _histCols.forEach(function(hCol){
+        _fbDb.ref(SHARED_PATH+'/'+hCol).limitToLast(200).once('value', function(snap){
+          var d = snap.val();
+          if(!d) return;
+          Object.keys(d).forEach(function(id){
+            var val = d[id];
+            if(!val) return;
+            // Пропускаем если в blacklist
+            if(window._rtDeleted && window._rtDeleted[hCol] && window._rtDeleted[hCol][String(id)]) return;
+            // Сохраняем в IDB через общий idbWriteQueue
+            var path = SHARED_PATH+'/'+hCol+'/'+id;
+            if(!window._idbWriteQueue) window._idbWriteQueue = {};
+            window._idbWriteQueue['rt:'+path] = JSON.stringify(val);
+            // Парсим и вызываем listener с небольшим debounce
+            try {
+              var parsed = (typeof val.d==='string') ? JSON.parse(val.d) : (val.d !== undefined ? val.d : val);
+              _rtFire(hCol, 'add', id, parsed, val.ts);
+            } catch(e){}
+          });
+          // Сбрасываем очередь IDB
+          if(!window._idbWriteTimer && window._idbWriteQueue && Object.keys(window._idbWriteQueue).length){
+            window._idbWriteTimer = setTimeout(function(){
+              var queue = window._idbWriteQueue||{};
+              window._idbWriteQueue={};window._idbWriteTimer=null;
+              var keys=Object.keys(queue);if(!keys.length)return;
+              idbOpen().then(function(db){
+                var tx=db.transaction('kv','readwrite');var store=tx.objectStore('kv');
+                keys.forEach(function(k){store.put({k:k,v:queue[k]});});
+              }).catch(function(){});
+            },200);
+          }
+        }).catch(function(){});
+      });
+
       window.dispatchEvent(new CustomEvent('AT_fb_ready'));
       // Announce подписка произойдёт через .info/connected или AT_fb_ready
       // Принудительно загружаем текущее announce при каждой инициализации
@@ -4540,6 +4586,24 @@ e.target.setSelectionRange(start,end);
 let qrHistory=[];
 const MAX_HISTORY=50;
 
+// Debounce для renderHistory — батчируем перерисовку чтобы не рендерить 300 раз подряд
+var _renderHistTimer=null;
+function renderHistoryDebounced(){
+  if(_renderHistTimer) clearTimeout(_renderHistTimer);
+  _renderHistTimer=setTimeout(function(){
+    _renderHistTimer=null;
+    if(typeof renderHistory==='function') try{ renderHistory(); }catch(e){}
+  }, 80);
+}
+var _renderHistTrbxTimer=null;
+function renderHistoryTrbxDebounced(){
+  if(_renderHistTrbxTimer) clearTimeout(_renderHistTrbxTimer);
+  _renderHistTrbxTimer=setTimeout(function(){
+    _renderHistTrbxTimer=null;
+    if(typeof renderHistoryTrbx==='function') try{ renderHistoryTrbx(); }catch(e){}
+  }, 80);
+}
+
 function loadHistory(){
   // Из LS кэша немедленно
   const saved=localStorage.getItem('qrHistory');
@@ -4557,7 +4621,7 @@ function loadHistory(){
         }catch(e){}
       });
       qrHistory.sort(function(a,b){return b.timestamp-a.timestamp;});
-      if(typeof renderHistory==='function') try{ renderHistory(); }catch(e){}
+      renderHistoryDebounced();
     });
   }
   // Подписка на real-time: новые записи от других устройств
@@ -4572,13 +4636,13 @@ function loadHistory(){
         if(eidx>=0){ qrHistory[eidx]=data; } else { qrHistory.unshift(data); }
         qrHistory.sort(function(a,b){return b.timestamp-a.timestamp;});
         saveHistory();
-        if(typeof renderHistory==='function') try{ renderHistory(); }catch(e){}
+        renderHistoryDebounced();
       } else if(action==='remove'){
         // Пропускаем если удаление уже сделано локально
         if(window._rtDelInProgress_qr && String(window._rtDelInProgress_qr)===String(id)) return;
         qrHistory=qrHistory.filter(function(x){return String(x.timestamp)!==String(id);});
         saveHistory();
-        if(typeof renderHistory==='function') try{ renderHistory(); }catch(e){}
+        renderHistoryDebounced();
       }
     });
   }
@@ -4770,7 +4834,7 @@ function loadHistoryTrbx(){
         }catch(e){}
       });
       trbxHistory.sort(function(a,b){return b.timestamp-a.timestamp;});
-      if(typeof renderHistoryTrbx==='function') try{ renderHistoryTrbx(); }catch(e){}
+      renderHistoryTrbxDebounced();
     });
   }
   if(typeof AT_rtListen==='function'){
@@ -4784,12 +4848,12 @@ function loadHistoryTrbx(){
         if(eidx>=0){ trbxHistory[eidx]=data; } else { trbxHistory.unshift(data); }
         trbxHistory.sort(function(a,b){return b.timestamp-a.timestamp;});
         saveHistoryTrbx();
-        if(typeof renderHistoryTrbx==='function') try{ renderHistoryTrbx(); }catch(e){}
+        renderHistoryTrbxDebounced();
       } else if(action==='remove'){
         if(window._rtDelInProgress_trbx && String(window._rtDelInProgress_trbx)===String(id)) return;
         trbxHistory=trbxHistory.filter(function(x){return String(x.timestamp)!==String(id);});
         saveHistoryTrbx();
-        if(typeof renderHistoryTrbx==='function') try{ renderHistoryTrbx(); }catch(e){}
+        renderHistoryTrbxDebounced();
       }
     });
   }
